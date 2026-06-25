@@ -22,6 +22,9 @@ alongside this.
 
 ## Setup
 
+**On Windows?** Follow [`SETUP_WINDOWS.md`](./SETUP_WINDOWS.md) for click-by-click
+steps (install Python, download, run, schedule daily). The short version:
+
 ```bash
 cd job_tracker
 pip install -r requirements.txt
