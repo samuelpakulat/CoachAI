@@ -1,0 +1,7 @@
+# Generated data and secrets
+run.log
+*.log
+__pycache__/
+*.pyc
+.env
+secrets.bat
