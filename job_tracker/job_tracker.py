@@ -96,6 +96,10 @@ THEMUSE_API_KEY = os.environ.get("THEMUSE_API_KEY", "")
 # File the results are stored in (acts as the persistent "yesterday's list").
 CSV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jobs.csv")
 
+# A readable page (clickable job links, Canada-first) regenerated every run.
+# GitHub renders this like a document -- open it on your phone and tap a job.
+MARKDOWN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "JOBS.md")
+
 # ---- Email alerts -----------------------------------------------------------
 # Set EMAIL_ENABLED = True to send a daily alert when new jobs are found.
 # For Gmail, create an "App Password" (Google Account > Security > 2-Step
@@ -455,6 +459,64 @@ def append_jobs(csv_path: str, jobs: list[Job]) -> None:
 
 
 # ----------------------------------------------------------------------------
+# Readable Markdown page (clickable links, Canada-first)
+# ----------------------------------------------------------------------------
+
+_PRIORITY_LOCATIONS = ("canada", "anywhere", "worldwide", "global", "ontario",
+                       "toronto", "americas", "north america")
+
+
+def _clean_location(loc: str) -> str:
+    """Tidy messy location strings like 'Houston, Houston, Texas' -> 'Houston, Texas'."""
+    seen: list[str] = []
+    for part in (loc or "").split(","):
+        part = part.strip()
+        if part and part.lower() not in [s.lower() for s in seen]:
+            seen.append(part)
+    return ", ".join(seen)
+
+
+def _is_priority(row: dict) -> bool:
+    loc = (row.get("Location") or "").lower()
+    return any(a in loc for a in _PRIORITY_LOCATIONS)
+
+
+def write_markdown(csv_path: str, md_path: str) -> None:
+    """Regenerate the readable JOBS.md page from the full CSV."""
+    if not os.path.exists(csv_path):
+        return
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+
+    # Newest first, then float Canada / Anywhere roles to the top (stable sort).
+    rows.sort(key=lambda r: r.get("Date Found", ""), reverse=True)
+    rows.sort(key=lambda r: 0 if _is_priority(r) else 1)
+
+    lines = [
+        "# 🗂️ Remote Job Matches",
+        "",
+        f"_Updated {date.today().isoformat()} · {len(rows)} jobs · "
+        "tap a job title to open the posting and apply. Canada / Anywhere roles are listed first._",
+        "",
+        "| Job (tap to apply) | Company | Location | Source | Status |",
+        "|---|---|---|---|---|",
+    ]
+    for r in rows:
+        title = (r.get("Job Title") or "").replace("|", "/").strip()
+        url = (r.get("URL") or "").strip()
+        company = (r.get("Company") or "").replace("|", "/").strip() or "—"
+        loc = _clean_location(r.get("Location") or "").replace("|", "/") or "—"
+        source = (r.get("Source") or "").strip()
+        status = (r.get("Status") or "").strip()
+        link = f"[{title}]({url})" if url else title
+        lines.append(f"| {link} | {company} | {loc} | {source} | {status} |")
+    lines.append("")
+
+    with open(md_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+
+
+# ----------------------------------------------------------------------------
 # Email alert
 # ----------------------------------------------------------------------------
 
@@ -549,6 +611,10 @@ def main() -> int:
         send_email_alert(new_jobs)
     else:
         log("No new jobs since last run.")
+
+    # Always refresh the readable page so the date/order stay current.
+    write_markdown(CSV_FILE, MARKDOWN_FILE)
+    log(f"Wrote {MARKDOWN_FILE}.")
 
     return 0
 
