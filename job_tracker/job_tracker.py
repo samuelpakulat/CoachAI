@@ -69,6 +69,13 @@ LOCATION = "Canada"
 # How many result pages to pull per source (keep small/polite).
 PAGES = 2
 
+# Drop postings whose title contains any of these (you want entry-level roles,
+# not senior/management ones). Edit freely -- remove a word to let it back in.
+EXCLUDE_TITLE_KEYWORDS = [
+    "senior", "sr.", "sr ", "staff", "principal", "lead ", " lead",
+    "director", "head of", "vp ", "vice president", "architect", "manager",
+]
+
 # Which sources to use.
 SOURCES = {
     "remotive": True,
@@ -173,6 +180,12 @@ _LOCATION_ALLOW = ("canada", "anywhere", "worldwide", "global", "north america",
 _LOCATION_BLOCK = ("usa only", "us only", "united states only", "us-only",
                    "europe only", "uk only", "eu only", "emea only", "apac only",
                    "india only", "us based", "u.s. only")
+
+
+def title_excluded(title: str) -> bool:
+    """True if the title looks too senior (per EXCLUDE_TITLE_KEYWORDS)."""
+    t = f" {(title or '').lower()} "
+    return any(bad in t for bad in EXCLUDE_TITLE_KEYWORDS)
 
 
 def location_ok(loc: str) -> bool:
@@ -504,6 +517,15 @@ def main() -> int:
             results = []
         log(f"  {name}: {len(results)} result(s)")
         scraped.extend(results)
+
+    # Relevance filter: every posting must actually match a keyword in its title
+    # (Remotive/Adzuna search loosely server-side) and not be a senior role.
+    relevant = [
+        job for job in scraped
+        if matches_keywords(job.title, KEYWORDS) and not title_excluded(job.title)
+    ]
+    log(f"After relevance filter: {len(relevant)} of {len(scraped)} kept.")
+    scraped = relevant
 
     # De-duplicate within this run: by URL, and collapse obvious cross-source
     # duplicates that share the same title + company.

@@ -20,6 +20,28 @@ def test_keyword_matcher():
     assert jt.matches_keywords("Software Engineer", ["data analyst"]) is None
 
 
+def test_title_excluded():
+    assert jt.title_excluded("Senior Quality Engineer")
+    assert jt.title_excluded("Staff Product Engineer")
+    assert jt.title_excluded("Engineering Manager")
+    assert not jt.title_excluded("Customer Support Specialist")
+    assert not jt.title_excluded("Remote Coordinator")
+
+
+def test_relevance_filter():
+    # Mimics main()'s central filter on the kind of junk Remotive returned.
+    scraped = [
+        jt.Job("Senior Quality Engineer", "LawnStarter", "https://x/1"),     # senior -> drop
+        jt.Job("Staff Product Engineer", "LawnStarter", "https://x/2"),       # senior -> drop
+        jt.Job("Frontend Developer", "Quinncia", "https://x/3"),              # no keyword -> drop
+        jt.Job("Customer Support Specialist", "Acme", "https://x/4"),         # keep
+        jt.Job("Remote Coordinator", "Beta", "https://x/5"),                  # keep
+    ]
+    kept = [j for j in scraped
+            if jt.matches_keywords(j.title, KW) and not jt.title_excluded(j.title)]
+    assert [j.title for j in kept] == ["Customer Support Specialist", "Remote Coordinator"]
+
+
 def test_location_filter():
     assert jt.location_ok("Canada")
     assert jt.location_ok("Anywhere in the World")
