@@ -1,36 +1,31 @@
 #!/usr/bin/env python3
 """
-Job Alert & Tracker
-===================
+Remote Job Alert & Tracker
+==========================
 
-Scrapes job listings from LinkedIn and Indeed for a set of keywords, saves the
-results to a CSV, and emails you a daily alert when *new* jobs appear that
-weren't already in the CSV.
+Pulls remote job listings from several *reliable* job-board APIs/feeds (the
+kind that are meant to be queried and don't block you), saves new postings to a
+CSV, and emails you a daily alert when new jobs appear that weren't already on
+the list.
+
+Sources (no scraping of LinkedIn/Indeed -- those block bots):
+  - Remotive          (free JSON API, per-keyword search)
+  - RemoteOK          (free JSON API, recent postings)
+  - We Work Remotely  (public RSS feed)
+  - Adzuna            (free API, Canada coverage -- needs a free key, optional)
+  - The Muse          (free API, good for entry-level -- optional)
 
 Quick start
 -----------
-1. Edit the CONFIG block below (keywords, location, email).
-2. Run it:        python3 job_tracker.py
-3. To enable email alerts, set EMAIL_ENABLED = True and export your SMTP
-   password (see the EMAIL section below):
-       export JOB_TRACKER_EMAIL_PASSWORD="your-app-password"
+1. Edit the CONFIG block below (keywords, location, email, source keys).
+2. Install deps:   pip install -r requirements.txt
+3. Run it:         python3 job_tracker.py
 
 Run it once a day (e.g. via cron) to get a daily diff of new postings.
-
-A note on scraping (please read)
---------------------------------
-- LinkedIn is scraped through its public, no-login "guest" jobs endpoint. This
-  is the most reliable path and usually works well for personal/light use.
-- Indeed actively blocks automated requests (Cloudflare / anti-bot). The Indeed
-  scraper here is best-effort: when Indeed blocks the request, the script logs a
-  warning and carries on with whatever it could collect. It is not guaranteed.
-- Scrapers break whenever these sites change their markup, and heavy use may
-  violate their Terms of Service. Keep the volume low and be a good citizen.
 """
 
 import csv
 import os
-import re
 import smtplib
 import sys
 import time
@@ -46,34 +41,61 @@ from bs4 import BeautifulSoup
 # CONFIG  --  edit this block
 # ============================================================================
 
-# Keywords to search for. One search is run per keyword on each site.
+# Keywords to search for. Steady, entry-level remote roles that hire year-round.
 KEYWORDS = [
+    # original picks
     "remote coordinator",
     "data analyst",
     "content moderator",
     "insurance remote",
+    # widened: ongoing entry-level remote categories that hire students
+    "customer support",
+    "customer success",
+    "virtual assistant",
+    "administrative assistant",
+    "sales development representative",
+    "operations coordinator",
+    "community moderator",
+    "social media coordinator",
+    "data entry",
+    "quality assurance tester",
 ]
 
-# Where to search. LinkedIn/Indeed both understand free-text locations.
-LOCATION = "Ontario, Canada"
+# Soft location preference. Jobs explicitly restricted to other regions (e.g.
+# "US only", "Europe only") are dropped; Canada / Worldwide / Anywhere / unknown
+# are kept. Used by Adzuna's location filter too.
+LOCATION = "Canada"
 
-# Indeed domain to use (ca = Canada). e.g. "ca.indeed.com", "www.indeed.com".
-INDEED_DOMAIN = "ca.indeed.com"
+# How many result pages to pull per source (keep small/polite).
+PAGES = 2
 
-# How many result pages to pull per keyword, per site (keep this small/polite).
-PAGES_PER_KEYWORD = 2
+# Which sources to use.
+SOURCES = {
+    "remotive": True,
+    "remoteok": True,
+    "weworkremotely": True,
+    "adzuna": True,     # only runs if ADZUNA keys are set below
+    "themuse": True,
+}
+
+# Adzuna: free keys from https://developer.adzuna.com/ (read from env so they
+# never live in this file). Leave unset to skip Adzuna.
+ADZUNA_APP_ID = os.environ.get("ADZUNA_APP_ID", "")
+ADZUNA_APP_KEY = os.environ.get("ADZUNA_APP_KEY", "")
+
+# The Muse: optional API key (works without one, just lower rate limits).
+THEMUSE_API_KEY = os.environ.get("THEMUSE_API_KEY", "")
 
 # File the results are stored in (acts as the persistent "yesterday's list").
 CSV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jobs.csv")
 
 # ---- Email alerts -----------------------------------------------------------
 # Set EMAIL_ENABLED = True to send a daily alert when new jobs are found.
-# For Gmail you must create an "App Password" (Google Account > Security >
-# 2-Step Verification > App passwords) and export it as JOB_TRACKER_EMAIL_PASSWORD.
-# The password is read from the environment so it never lives in this file.
+# For Gmail, create an "App Password" (Google Account > Security > 2-Step
+# Verification > App passwords) and export it as JOB_TRACKER_EMAIL_PASSWORD.
 EMAIL_ENABLED = False
 EMAIL_TO = "samuelpakulat@gmail.com"
-EMAIL_FROM = "samuelpakulat@gmail.com"     # the sending account
+EMAIL_FROM = "samuelpakulat@gmail.com"
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 SMTP_USERNAME = EMAIL_FROM
@@ -82,8 +104,9 @@ SMTP_PASSWORD = os.environ.get("JOB_TRACKER_EMAIL_PASSWORD", "")
 # Be polite: seconds to wait between HTTP requests.
 REQUEST_DELAY_SECONDS = 1.5
 
-# CSV column order.
-CSV_COLUMNS = ["Job Title", "Company", "URL", "Date Found", "Status"]
+# CSV column order. (Source + Location added so you can prioritise Canada-OK
+# roles and apply on the company site quickly.)
+CSV_COLUMNS = ["Job Title", "Company", "URL", "Date Found", "Status", "Source", "Location"]
 
 # ============================================================================
 # End of config
@@ -101,26 +124,20 @@ class Job:
     company: str
     url: str
     source: str = ""
+    location: str = ""
     date_found: str = field(default_factory=lambda: date.today().isoformat())
     status: str = "not applied"
 
     @property
     def key(self) -> str:
-        """Stable identity for de-duplication.
+        """Stable identity for de-duplication: URL without query/fragment.
 
-        LinkedIn encodes the job id in the URL path, while Indeed encodes it in
-        the ``jk`` query parameter. So we keep the path *and* the ``jk`` param
-        but drop volatile tracking params (refId, trk, ...) that change between
-        requests for the same job.
+        All the sources used here put the job id in the URL *path*, so dropping
+        query strings (tracking params) gives a stable key.
         """
         parts = urlsplit(self.url)
-        jk = ""
-        for pair in parts.query.split("&"):
-            if pair.startswith("jk="):
-                jk = pair
-                break
         return urlunsplit(
-            (parts.scheme, parts.netloc, parts.path, jk, "")
+            (parts.scheme, parts.netloc, parts.path, "", "")
         ).rstrip("/").lower()
 
 
@@ -128,149 +145,260 @@ def log(msg: str) -> None:
     print(f"[job-tracker] {msg}", flush=True)
 
 
-def _get(url: str, params=None) -> requests.Response | None:
+# ----------------------------------------------------------------------------
+# Filtering helpers
+# ----------------------------------------------------------------------------
+
+def matches_keywords(text: str, keywords: list[str]) -> str | None:
+    """Return the first keyword that matches, or None.
+
+    A keyword matches when every word in it appears in `text` (case-insensitive),
+    so "remote coordinator" matches "Remote Project Coordinator".
+    """
+    haystack = (text or "").lower()
+    for kw in keywords:
+        if all(tok in haystack for tok in kw.lower().split()):
+            return kw
+    return None
+
+
+_LOCATION_ALLOW = ("canada", "anywhere", "worldwide", "global", "north america",
+                   "americas", "ontario", "toronto", "remote", "flexible")
+_LOCATION_BLOCK = ("usa only", "us only", "united states only", "us-only",
+                   "europe only", "uk only", "eu only", "emea only", "apac only",
+                   "india only", "us based", "u.s. only")
+
+
+def location_ok(loc: str) -> bool:
+    """Permissive location filter: keep unless clearly restricted away from Canada."""
+    l = (loc or "").lower().strip()
+    if not l:
+        return True
+    if any(a in l for a in _LOCATION_ALLOW):
+        return True
+    if any(b in l for b in _LOCATION_BLOCK):
+        return False
+    return True  # unknown / unrestricted -> keep, you can eyeball the column
+
+
+# ----------------------------------------------------------------------------
+# HTTP
+# ----------------------------------------------------------------------------
+
+def _get(url: str, params=None, accept_json=True) -> requests.Response | None:
     headers = {
         "User-Agent": USER_AGENT,
         "Accept-Language": "en-CA,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "application/json" if accept_json else "application/rss+xml, text/xml",
     }
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=20)
+        resp = requests.get(url, params=params, headers=headers, timeout=25)
     except requests.RequestException as exc:
         log(f"  request error: {exc}")
         return None
     time.sleep(REQUEST_DELAY_SECONDS)
+    if resp.status_code != 200:
+        log(f"  HTTP {resp.status_code} from {urlsplit(url).netloc}")
+        return None
     return resp
 
 
 # ----------------------------------------------------------------------------
-# LinkedIn (public guest jobs endpoint -- no login required)
+# Source: Remotive  (per-keyword JSON search)
 # ----------------------------------------------------------------------------
 
-LINKEDIN_GUEST_URL = (
-    "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
-)
-
-
-def scrape_linkedin(keyword: str, location: str) -> list[Job]:
+def fetch_remotive(keywords: list[str]) -> list[Job]:
     jobs: list[Job] = []
-    for page in range(PAGES_PER_KEYWORD):
-        params = {
-            "keywords": keyword,
-            "location": location,
-            "start": page * 25,  # LinkedIn returns ~25 cards per page
-        }
-        resp = _get(LINKEDIN_GUEST_URL, params=params)
+    for kw in keywords:
+        resp = _get("https://remotive.com/api/remote-jobs", params={"search": kw, "limit": 50})
         if resp is None:
-            break
-        if resp.status_code == 429:
-            log("  LinkedIn rate-limited (429); backing off.")
-            break
-        if resp.status_code != 200:
-            log(f"  LinkedIn returned HTTP {resp.status_code}; stopping this keyword.")
-            break
-
-        soup = BeautifulSoup(resp.text, "lxml")
-        cards = soup.select("li")
-        if not cards:
-            break
-
-        found_on_page = 0
-        for card in cards:
-            title_el = card.select_one(
-                "h3.base-search-card__title, .base-search-card__title"
-            )
-            company_el = card.select_one(
-                "h4.base-search-card__subtitle a, .base-search-card__subtitle"
-            )
-            link_el = card.select_one("a.base-card__full-link, a.base-card__full-link[href]")
-            if link_el is None:
-                link_el = card.select_one("a[href*='/jobs/view/']")
-            if not (title_el and link_el):
-                continue
-            title = title_el.get_text(strip=True)
-            company = company_el.get_text(strip=True) if company_el else ""
-            url = link_el.get("href", "").strip()
-            if not url:
-                continue
-            jobs.append(Job(title=title, company=company, url=url, source="LinkedIn"))
-            found_on_page += 1
-
-        if found_on_page == 0:
-            break
+            continue
+        try:
+            data = resp.json()
+        except ValueError:
+            continue
+        jobs.extend(parse_remotive(data))
     return jobs
 
 
+def parse_remotive(data: dict) -> list[Job]:
+    out: list[Job] = []
+    for j in data.get("jobs", []):
+        loc = j.get("candidate_required_location", "")
+        if not location_ok(loc):
+            continue
+        out.append(Job(
+            title=j.get("title", "").strip(),
+            company=j.get("company_name", "").strip(),
+            url=j.get("url", "").strip(),
+            source="Remotive",
+            location=loc,
+        ))
+    return [j for j in out if j.title and j.url]
+
+
 # ----------------------------------------------------------------------------
-# Indeed (best-effort -- frequently blocked by anti-bot protection)
+# Source: RemoteOK  (single JSON feed of recent jobs -> filter client-side)
 # ----------------------------------------------------------------------------
 
-def scrape_indeed(keyword: str, location: str) -> list[Job]:
+def fetch_remoteok(keywords: list[str]) -> list[Job]:
+    resp = _get("https://remoteok.com/api")
+    if resp is None:
+        return []
+    try:
+        data = resp.json()
+    except ValueError:
+        return []
+    return parse_remoteok(data, keywords)
+
+
+def parse_remoteok(data: list, keywords: list[str]) -> list[Job]:
+    out: list[Job] = []
+    for j in data:
+        if not isinstance(j, dict) or "position" not in j:
+            continue  # skips the leading legal-notice element
+        title = (j.get("position") or "").strip()
+        tags = " ".join(j.get("tags", []) or [])
+        if not matches_keywords(f"{title} {tags}", keywords):
+            continue
+        loc = (j.get("location") or "").strip()
+        if not location_ok(loc):
+            continue
+        url = (j.get("url") or "").strip()
+        if url.startswith("/"):
+            url = "https://remoteok.com" + url
+        out.append(Job(
+            title=title,
+            company=(j.get("company") or "").strip(),
+            url=url,
+            source="RemoteOK",
+            location=loc,
+        ))
+    return [j for j in out if j.title and j.url]
+
+
+# ----------------------------------------------------------------------------
+# Source: We Work Remotely  (RSS feed -> filter client-side)
+# ----------------------------------------------------------------------------
+
+def fetch_weworkremotely(keywords: list[str]) -> list[Job]:
+    resp = _get("https://weworkremotely.com/remote-jobs.rss", accept_json=False)
+    if resp is None:
+        return []
+    return parse_wwr(resp.text, keywords)
+
+
+def parse_wwr(xml_text: str, keywords: list[str]) -> list[Job]:
+    out: list[Job] = []
+    soup = BeautifulSoup(xml_text, "xml")
+    for item in soup.find_all("item"):
+        raw_title = (item.title.get_text(strip=True) if item.title else "")
+        link = (item.link.get_text(strip=True) if item.link else "")
+        region_el = item.find("region")
+        loc = region_el.get_text(strip=True) if region_el else ""
+        # WWR titles look like "Company Name: Job Title"
+        if ":" in raw_title:
+            company, title = raw_title.split(":", 1)
+        else:
+            company, title = "", raw_title
+        title, company = title.strip(), company.strip()
+        if not matches_keywords(title, keywords):
+            continue
+        if not location_ok(loc):
+            continue
+        out.append(Job(title=title, company=company, url=link,
+                       source="WeWorkRemotely", location=loc))
+    return [j for j in out if j.title and j.url]
+
+
+# ----------------------------------------------------------------------------
+# Source: Adzuna  (per-keyword JSON search, Canada -- needs free API keys)
+# ----------------------------------------------------------------------------
+
+def fetch_adzuna(keywords: list[str]) -> list[Job]:
+    if not (ADZUNA_APP_ID and ADZUNA_APP_KEY):
+        log("  Adzuna skipped (ADZUNA_APP_ID / ADZUNA_APP_KEY not set).")
+        return []
     jobs: list[Job] = []
-    base = f"https://{INDEED_DOMAIN}/jobs"
-    for page in range(PAGES_PER_KEYWORD):
-        params = {"q": keyword, "l": location, "start": page * 10}
-        resp = _get(base, params=params)
+    for kw in keywords:
+        for page in range(1, PAGES + 1):
+            params = {
+                "app_id": ADZUNA_APP_ID,
+                "app_key": ADZUNA_APP_KEY,
+                "what": kw,
+                "where": LOCATION,
+                "content-type": "application/json",
+                "results_per_page": 25,
+            }
+            resp = _get(f"https://api.adzuna.com/v1/api/jobs/ca/search/{page}", params=params)
+            if resp is None:
+                break
+            try:
+                data = resp.json()
+            except ValueError:
+                break
+            page_jobs = parse_adzuna(data)
+            if not page_jobs:
+                break
+            jobs.extend(page_jobs)
+    return jobs
+
+
+def parse_adzuna(data: dict) -> list[Job]:
+    out: list[Job] = []
+    for j in data.get("results", []):
+        loc = (j.get("location", {}) or {}).get("display_name", "")
+        out.append(Job(
+            title=(j.get("title") or "").strip(),
+            company=(j.get("company", {}) or {}).get("display_name", "").strip(),
+            url=(j.get("redirect_url") or "").strip(),
+            source="Adzuna",
+            location=loc,
+        ))
+    return [j for j in out if j.title and j.url]
+
+
+# ----------------------------------------------------------------------------
+# Source: The Muse  (JSON, good for entry-level -> filter client-side)
+# ----------------------------------------------------------------------------
+
+def fetch_themuse(keywords: list[str]) -> list[Job]:
+    jobs: list[Job] = []
+    for page in range(PAGES):
+        params = {"page": page, "location": "Flexible / Remote"}
+        if THEMUSE_API_KEY:
+            params["api_key"] = THEMUSE_API_KEY
+        resp = _get("https://www.themuse.com/api/public/jobs", params=params)
         if resp is None:
             break
-        if resp.status_code != 200:
-            log(
-                f"  Indeed returned HTTP {resp.status_code} "
-                f"(likely anti-bot block); skipping."
-            )
+        try:
+            data = resp.json()
+        except ValueError:
             break
-
-        text = resp.text
-        if "Cloudflare" in text and "challenge" in text.lower():
-            log("  Indeed served a Cloudflare challenge; skipping.")
-            break
-
-        page_jobs = _parse_indeed(text)
-        if not page_jobs:
-            # No structured data found -- almost always means we were blocked
-            # or the markup changed.
-            if page == 0:
-                log("  Indeed: no job cards parsed (blocked or markup changed).")
-            break
+        page_jobs = parse_themuse(data, keywords)
         jobs.extend(page_jobs)
+        if not data.get("results"):
+            break
     return jobs
 
 
-def _parse_indeed(html: str) -> list[Job]:
-    """Pull jobs out of Indeed's embedded 'mosaic-provider-jobcards' JSON blob."""
-    jobs: list[Job] = []
-
-    # Indeed embeds job data as JSON inside a <script> tag. Locate the results
-    # array and pull out the fields we care about with light-weight parsing.
-    match = re.search(r'"results"\s*:\s*(\[.*?\])\s*,\s*"', html, re.DOTALL)
-    if not match:
-        return jobs
-
-    blob = match.group(1)
-    # Each job entry exposes jobkey / title / company fields.
-    for entry in re.finditer(
-        r'"jobkey":"(?P<jk>[^"]+)".*?"title":"(?P<title>[^"]*)"'
-        r'(?:.*?"company":"(?P<company>[^"]*)")?',
-        blob,
-        re.DOTALL,
-    ):
-        jk = entry.group("jk")
-        title = _unescape(entry.group("title") or "")
-        company = _unescape(entry.group("company") or "")
-        url = f"https://{INDEED_DOMAIN}/viewjob?jk={jk}"
-        if title:
-            jobs.append(Job(title=title, company=company, url=url, source="Indeed"))
-    return jobs
-
-
-def _unescape(s: str) -> str:
-    return (
-        s.replace("\\u0026", "&")
-        .replace("\\u002F", "/")
-        .replace('\\"', '"')
-        .replace("\\/", "/")
-        .strip()
-    )
+def parse_themuse(data: dict, keywords: list[str]) -> list[Job]:
+    out: list[Job] = []
+    for j in data.get("results", []):
+        title = (j.get("name") or "").strip()
+        if not matches_keywords(title, keywords):
+            continue
+        locs = ", ".join(loc.get("name", "") for loc in j.get("locations", []) or [])
+        if not location_ok(locs):
+            continue
+        out.append(Job(
+            title=title,
+            company=(j.get("company", {}) or {}).get("name", "").strip(),
+            url=(j.get("refs", {}) or {}).get("landing_page", "").strip(),
+            source="TheMuse",
+            location=locs,
+        ))
+    return [j for j in out if j.title and j.url]
 
 
 # ----------------------------------------------------------------------------
@@ -278,7 +406,6 @@ def _unescape(s: str) -> str:
 # ----------------------------------------------------------------------------
 
 def load_existing_keys(csv_path: str) -> set[str]:
-    """Return the set of URL-keys already recorded, so we can find new jobs."""
     keys: set[str] = set()
     if not os.path.exists(csv_path):
         return keys
@@ -297,15 +424,15 @@ def append_jobs(csv_path: str, jobs: list[Job]) -> None:
         if not file_exists:
             writer.writeheader()
         for job in jobs:
-            writer.writerow(
-                {
-                    "Job Title": job.title,
-                    "Company": job.company,
-                    "URL": job.url,
-                    "Date Found": job.date_found,
-                    "Status": job.status,
-                }
-            )
+            writer.writerow({
+                "Job Title": job.title,
+                "Company": job.company,
+                "URL": job.url,
+                "Date Found": job.date_found,
+                "Status": job.status,
+                "Source": job.source,
+                "Location": job.location,
+            })
 
 
 # ----------------------------------------------------------------------------
@@ -316,21 +443,19 @@ def send_email_alert(new_jobs: list[Job]) -> None:
     if not EMAIL_ENABLED:
         return
     if not SMTP_PASSWORD:
-        log(
-            "EMAIL_ENABLED is True but JOB_TRACKER_EMAIL_PASSWORD is not set; "
-            "skipping email."
-        )
+        log("EMAIL_ENABLED is True but JOB_TRACKER_EMAIL_PASSWORD is not set; skipping email.")
         return
 
-    lines = [f"{len(new_jobs)} new job(s) found on {date.today().isoformat()}:", ""]
+    lines = [f"{len(new_jobs)} new remote job(s) found on {date.today().isoformat()}:", ""]
     for job in new_jobs:
-        lines.append(f"- {job.title} @ {job.company or 'Unknown'} [{job.source}]")
+        loc = f" ({job.location})" if job.location else ""
+        lines.append(f"- {job.title} @ {job.company or 'Unknown'}{loc} [{job.source}]")
         lines.append(f"  {job.url}")
         lines.append("")
     body = "\n".join(lines)
 
     msg = MIMEText(body)
-    msg["Subject"] = f"Job Alert: {len(new_jobs)} new posting(s)"
+    msg["Subject"] = f"Remote Job Alert: {len(new_jobs)} new posting(s)"
     msg["From"] = EMAIL_FROM
     msg["To"] = EMAIL_TO
 
@@ -348,30 +473,47 @@ def send_email_alert(new_jobs: list[Job]) -> None:
 # Main
 # ----------------------------------------------------------------------------
 
+FETCHERS = {
+    "remotive": fetch_remotive,
+    "remoteok": fetch_remoteok,
+    "weworkremotely": fetch_weworkremotely,
+    "adzuna": fetch_adzuna,
+    "themuse": fetch_themuse,
+}
+
+
 def main() -> int:
-    log(f"Searching {len(KEYWORDS)} keyword(s) in '{LOCATION}'.")
+    log(f"Searching {len(KEYWORDS)} keyword(s), location preference '{LOCATION}'.")
     existing_keys = load_existing_keys(CSV_FILE)
     log(f"{len(existing_keys)} job(s) already on file.")
 
     scraped: list[Job] = []
-    for keyword in KEYWORDS:
-        log(f"Keyword: '{keyword}'")
-        li = scrape_linkedin(keyword, LOCATION)
-        log(f"  LinkedIn: {len(li)} result(s)")
-        scraped.extend(li)
+    for name, enabled in SOURCES.items():
+        if not enabled:
+            continue
+        try:
+            results = FETCHERS[name](KEYWORDS)
+        except Exception as exc:  # noqa: BLE001 -- one bad source shouldn't kill the run
+            log(f"  {name}: error ({exc}); continuing.")
+            results = []
+        log(f"  {name}: {len(results)} result(s)")
+        scraped.extend(results)
 
-        indeed = scrape_indeed(keyword, LOCATION)
-        log(f"  Indeed:   {len(indeed)} result(s)")
-        scraped.extend(indeed)
-
-    # De-duplicate within this run (same job can match multiple keywords).
+    # De-duplicate within this run: by URL, and collapse obvious cross-source
+    # duplicates that share the same title + company.
     unique: dict[str, Job] = {}
+    seen_title_company: set[tuple[str, str]] = set()
     for job in scraped:
-        unique.setdefault(job.key, job)
+        if job.key in unique:
+            continue
+        tc = (job.title.lower().strip(), job.company.lower().strip())
+        if tc != ("", "") and tc in seen_title_company:
+            continue
+        unique[job.key] = job
+        seen_title_company.add(tc)
 
-    # New = scraped this run but not already in the CSV.
     new_jobs = [job for key, job in unique.items() if key not in existing_keys]
-    log(f"Total scraped: {len(scraped)} | unique: {len(unique)} | new: {len(new_jobs)}")
+    log(f"Total: {len(scraped)} | unique: {len(unique)} | new: {len(new_jobs)}")
 
     if new_jobs:
         append_jobs(CSV_FILE, new_jobs)
