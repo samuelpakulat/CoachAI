@@ -112,6 +112,12 @@ CSV_COLUMNS = ["Job Title", "Company", "URL", "Date Found", "Status", "Source", 
 # End of config
 # ============================================================================
 
+# Let the cloud scheduler (GitHub Actions) toggle email via an env var, so it
+# can be enabled without editing this file.
+_env_email = os.environ.get("EMAIL_ENABLED")
+if _env_email is not None:
+    EMAIL_ENABLED = _env_email.strip().lower() in ("1", "true", "yes")
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"

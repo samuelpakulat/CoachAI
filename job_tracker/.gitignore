@@ -1,5 +1,4 @@
 # Generated data and secrets
-jobs.csv
 run.log
 *.log
 __pycache__/
